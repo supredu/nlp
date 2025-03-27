@@ -206,8 +206,8 @@ class MiniMindLM(PreTrainedModel):
         h = self.dropout(self.tok_embeddings(input_ids))
         pos_cis = self.pos_cis[start_pos : start_pos + input_ids.size(1)]
         past_kvs = []
-        for layer, layer in enumerate(self.layers):
-            h, past_kv = layer(h, pos_cis, past_key_value=past_key_values[layer], use_cache=use_cache)
+        for layer_idx, layer in enumerate(self.layers):
+            h, past_kv = layer(h, pos_cis, past_key_value=past_key_values[layer_idx], use_cache=use_cache)
             past_kvs.append(past_kv)
         logits = self.output(self.norm(h))
         self.OUT.__setitem__("logits", logits)
