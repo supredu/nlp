@@ -1,6 +1,8 @@
 import argparse
 import warnings
+
 import torch
+
 from trainer import SFTTrainer
 
 warnings.filterwarnings("ignore")
@@ -30,7 +32,9 @@ def parse_args():
     parser.add_argument("--data_path", type=str, default="./data/sft.jsonl")
 
     args = parser.parse_args()
-    args.wandb_run_name = f"MiniMind-Full-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+    args.wandb_run_name = (
+        f"MiniMind-Full-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+    )
 
     return args
 
@@ -39,6 +43,7 @@ def main():
     args = parse_args()
     trainer = SFTTrainer(args)
     trainer.run()
+    trainer.eval()
 
 
 if __name__ == "__main__":

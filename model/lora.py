@@ -19,7 +19,6 @@ class LoRA(nn.Module):
         # And initialize A with normal distribution with mean 0 and std 0.02, and B with zeros
         # Write your code here
 
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through the LoRA module."""
         # Write your code here
@@ -54,6 +53,7 @@ def apply_lora(model: nn.Module, rank: int = 16):
         def make_forward_with_lora(orig_forward, lora_module):
             def forward_with_lora(x):
                 return orig_forward(x) + lora_module(x)
+
             return forward_with_lora
 
         # Replace the forward method
