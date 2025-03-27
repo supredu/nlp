@@ -52,11 +52,18 @@ class TrainerBase:
     def __init__(self, args):
         self.args = args
         self.ddp = int(os.environ.get("RANK", -1)) != -1
+        self.start_epoch = 0
         self.setup_environment()
         self.setup_model()
         self.setup_dataloader()
         self.setup_evaluator()
         self.setup_training()
+        self.try_load_checkpoint()
+
+    def try_load_checkpoint(self):
+        """Load checkpoint if specified"""
+        if self.args.resume_from_checkpoint:
+            self.load_checkpoint()
 
     def setup_environment(self):
         # Set up DDP if enabled
@@ -149,19 +156,6 @@ class TrainerBase:
         lr = self.args.learning_rate
         return lr / 10 + 0.5 * lr * (1 + math.cos(math.pi * current_step / total_steps))
 
-    def save_checkpoint(self):
-        """Save model checkpoint"""
-        self.model.eval()
-        ckp = f"{self.args.out_dir}/{self.category}_{self.lm_config.dim}.pth"
-
-        if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
-            state_dict = self.model.module.state_dict()
-        else:
-            state_dict = self.model.state_dict()
-
-        torch.save(state_dict, ckp)
-        self.model.train()
-
     def train_epoch(self, epoch):
         """Train for one epoch"""
         raise NotImplementedError
@@ -189,7 +183,7 @@ class TrainerBase:
 
     def run(self):
         """Run the full training process"""
-        for epoch in range(self.args.epochs):
+        for epoch in range(self.start_epoch, self.args.epochs):
             self.train_epoch(epoch)
 
     def eval(self):
@@ -226,6 +220,38 @@ class TrainerBase:
                 predictions.append(prediction)
 
         return predictions
+
+    def load_checkpoint(self):
+        """Load model checkpoint for continuing training"""
+        if os.path.isfile(self.args.resume_from_checkpoint):
+            self.log(f"Loading checkpoint from {self.args.resume_from_checkpoint}")
+            self.checkpoint = torch.load(self.args.resume_from_checkpoint, map_location=self.args.device)
+
+            # Load each component of the checkpoint
+            self.model.load_state_dict(self.checkpoint["model_state_dict"])
+            self.optimizer.load_state_dict(self.checkpoint["optimizer"])
+            self.scaler.load_state_dict(self.checkpoint["scaler"])
+            self.start_epoch = self.checkpoint["epoch"] + 1
+            self.log("Checkpoint loaded successfully")
+        else:
+            self.start_epoch = 0
+            self.log(f"No checkpoint found at {self.args.resume_from_checkpoint}")
+
+    def save_checkpoint(self, epoch):
+        """Save model checkpoint with training state"""
+        self.model.eval()
+        checkpoint = {
+            "model_state_dict": self.model.module.state_dict() if self.ddp else self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "scaler": self.scaler.state_dict() if self.scaler is not None else None,
+            "epoch": epoch,
+        }
+
+        checkpoint_path = f"{self.args.out_dir}/{self.category}_{self.lm_config.dim}.pth"
+        torch.save(checkpoint, checkpoint_path)
+
+        self.log(f"Checkpoint saved to {checkpoint_path}")
+        self.model.train()
 
 
 class PreTrainer(TrainerBase):
@@ -295,9 +321,9 @@ class PreTrainer(TrainerBase):
             if step % self.args.log_interval == 0:
                 self.log_progress(epoch, step, loss, start_time)
 
-            # Save checkpoint
-            if (step + 1) % self.args.save_interval == 0 and (not self.ddp or self.ddp_local_rank == 0):
-                self.save_checkpoint()
+        # Save checkpoint at epoch end
+        if not self.ddp or self.ddp_local_rank == 0:
+            self.save_checkpoint(epoch=epoch)
 
     def get_predictions(self, dataset: Dataset):
         raise NotImplementedError("Pretraining does not support prediction generation.")
@@ -376,9 +402,9 @@ class SFTTrainer(TrainerBase):
             if step % self.args.log_interval == 0:
                 self.log_progress(epoch, step, loss, start_time)
 
-            # Save checkpoint
-            if (step + 1) % self.args.save_interval == 0 and (not self.ddp or self.ddp_local_rank == 0):
-                self.save_checkpoint()
+        # Save checkpoint at epoch end
+        if not self.ddp or self.ddp_local_rank == 0:
+            self.save_checkpoint(epoch=epoch)
 
 
 class LoraTrainer(SFTTrainer):
@@ -469,9 +495,9 @@ class LoraTrainer(SFTTrainer):
             if step % self.args.log_interval == 0:
                 self.log_progress(epoch, step, loss, start_time)
 
-            # Save checkpoint
-            if (step + 1) % self.args.save_interval == 0 and (not self.ddp or self.ddp_local_rank == 0):
-                self.save_checkpoint()
+        # Save checkpoint at epoch end
+        if not self.ddp or self.ddp_local_rank == 0:
+            self.save_checkpoint(epoch=epoch)
 
 
 class DPOTrainer(TrainerBase):
@@ -572,6 +598,6 @@ class DPOTrainer(TrainerBase):
             if step % self.args.log_interval == 0:
                 self.log_progress(epoch, step, loss, start_time)
 
-            # Save checkpoint
-            if (step + 1) % self.args.save_interval == 0 and (not self.ddp or self.ddp_local_rank == 0):
-                self.save_checkpoint()
+        # Save checkpoint at epoch end
+        if not self.ddp or self.ddp_local_rank == 0:
+            self.save_checkpoint(epoch=epoch)
