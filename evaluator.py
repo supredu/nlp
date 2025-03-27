@@ -1,5 +1,6 @@
 import torch
 from comet import download_model, load_from_checkpoint
+import math
 
 
 class Evaluator:
@@ -31,7 +32,9 @@ class PerplexityEvaluator(Evaluator):
                 loss_mask = loss_mask.to(self.trainer.args.device)
 
                 res = self.trainer.model(X)
-                loss = self.trainer.loss_fct(res.logits.view(-1, res.logits.size(-1)), Y.view(-1)).view(Y.size())
+                loss = self.trainer.loss_fct(
+                    res.logits.view(-1, res.logits.size(-1)), Y.view(-1)
+                ).view(Y.size())
                 loss = (loss * loss_mask).sum()  # Sum loss for valid tokens
                 total_loss += loss.item()
                 total_tokens += loss_mask.sum().item()  # Count valid tokens
@@ -48,7 +51,9 @@ class CometEvaluator(Evaluator):
 
     def __init__(self, trainer):
         super().__init__(trainer)
-        self.comet_model = load_from_checkpoint(download_model("Unbabel/wmt22-comet-da"))
+        self.comet_model = load_from_checkpoint(
+            download_model("Unbabel/wmt22-comet-da")
+        )
 
     def _build_data(
         self,
@@ -78,7 +83,9 @@ class CometEvaluator(Evaluator):
         references: list[str] = self.trainer.val_loader.dataset.get_references()
 
         # Collect predictions from the model
-        predictions: list[str] = self.trainer.get_predictions(self.trainer.val_loader.dataset)
+        predictions: list[str] = self.trainer.get_predictions(
+            self.trainer.val_loader.dataset
+        )
 
         # Build data for COMET evaluation
         data: list[dict[str, str]] = self._build_data(sources, references, predictions)
