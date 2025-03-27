@@ -1,20 +1,21 @@
+import math
 import os
 import time
-import math
+from contextlib import nullcontext
+
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
+from torch import nn, optim
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from transformers import AutoTokenizer
 
-from torch.utils.data import DataLoader, DistributedSampler
-from contextlib import nullcontext
-from torch.utils.data import Dataset
-from dataset import PretrainDataset, SFTDataset, DPODataset
-from model.model import MiniMindLM
+from dataset import DPODataset, PretrainDataset, SFTDataset
+from evaluator import CometEvaluator, Evaluator, PerplexityEvaluator
 from model.config import LMConfig
 from model.lora import apply_lora
-from transformers import AutoTokenizer
-from torch import optim, nn
-from torch.nn.parallel import DistributedDataParallel
-import torch.nn.functional as F
+from model.model import MiniMindLM
 
 
 def logits_to_probs(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -24,9 +25,7 @@ def logits_to_probs(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     return probs
 
 
-def dpo_loss(
-    ref_probs: torch.Tensor, probs: torch.Tensor, beta: float = 0.1
-) -> torch.Tensor:
+def dpo_loss(ref_probs: torch.Tensor, probs: torch.Tensor, beta: float = 0.1) -> torch.Tensor:
     """Calculate DPO loss between reference and policy model probabilities."""
     # Average probabilities across sequence length
     ref_probs = ref_probs.mean(dim=1)
@@ -44,9 +43,11 @@ def dpo_loss(
 
     return loss.mean()
 
+
 class TrainerBase:
     category: str
     dataset_cls: type[Dataset]
+    evaluator_cls: type[Evaluator]
 
     def __init__(self, args):
         self.args = args
@@ -54,6 +55,7 @@ class TrainerBase:
         self.setup_environment()
         self.setup_model()
         self.setup_dataloader()
+        self.setup_evaluator()
         self.setup_training()
 
     def setup_environment(self):
@@ -107,9 +109,7 @@ class TrainerBase:
         )
 
         # Split into train and validation sets
-        train_ds, val_ds = torch.utils.data.random_split(
-            ds, [int(len(ds) * 0.9), len(ds) - int(len(ds) * 0.9)]
-        )
+        train_ds, val_ds = torch.utils.data.random_split(ds, [int(len(ds) * 0.9), len(ds) - int(len(ds) * 0.9)])
 
         # Initialize train dataloader
         train_sampler = DistributedSampler(train_ds) if self.ddp else None
@@ -137,6 +137,9 @@ class TrainerBase:
         )
         self.log(f"Train dataset size: {len(train_ds)}")
         self.log(f"Validation dataset size: {len(val_ds)}")
+
+    def setup_evaluator(self):
+        self.evaluator = self.evaluator_cls(self)
 
     def setup_training(self):
         raise NotImplementedError
@@ -166,9 +169,7 @@ class TrainerBase:
     def log_progress(self, epoch, step, loss, start_time):
         """Log training progress"""
         spend_time = time.time() - start_time
-        estimated_epoch_time = (
-            spend_time / (step + 1) * self.iter_per_epoch // 60 - spend_time // 60
-        )
+        estimated_epoch_time = spend_time / (step + 1) * self.iter_per_epoch // 60 - spend_time // 60
 
         self.log(
             f"Epoch:[{epoch + 1}/{self.args.epochs}]({step}/{self.iter_per_epoch}) "
@@ -191,10 +192,46 @@ class TrainerBase:
         for epoch in range(self.args.epochs):
             self.train_epoch(epoch)
 
+    def eval(self):
+        """Evaluate the model"""
+        self.evaluator.eval()
+
+    def get_predictions(self, dataset: Dataset):
+        """
+        Get predictions from the model
+        """
+        self.model.eval()
+        predictions: list[str] = []
+        with torch.no_grad():
+            for messages in dataset.messages_lst:
+                prompt = self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )[-self.args.max_seq_len + 1 :]
+                input_ids = torch.tensor(self.tokenizer(prompt)["input_ids"], device=self.args.device).unsqueeze(0)
+                outputs = self.model.generate(
+                    input_ids,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    max_new_tokens=self.args.max_seq_len,
+                    temperature=self.args.temperature,
+                    top_p=self.args.top_p,
+                    stream=True,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
+                prediction = self.tokenizer.decode(
+                    outputs.squeeze()[input_ids.shape[1] :].tolist(),
+                    skip_special_tokens=True,
+                )
+                predictions.append(prediction)
+
+        return predictions
+
 
 class PreTrainer(TrainerBase):
     category: str = "pretrain"
     dataset_cls: type[Dataset] = PretrainDataset
+    evaluator_cls: type[Evaluator] = PerplexityEvaluator
 
     def setup_model(self):
         # Initialize model and tokenizer
@@ -212,20 +249,14 @@ class PreTrainer(TrainerBase):
 
     def setup_training(self):
         # Initialize optimizer, loss function, and scaler
-        self.optimizer = optim.AdamW(
-            self.model.parameters(), lr=self.args.learning_rate
-        )
-        self.scaler = torch.cuda.amp.GradScaler(
-            enabled=(self.args.dtype in ["float16", "bfloat16"])
-        )
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=self.args.learning_rate)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=(self.args.dtype in ["float16", "bfloat16"]))
         self.loss_fct = nn.CrossEntropyLoss(reduction="none")
 
         # Set up DDP model if needed
         if self.ddp:
             self.model._ddp_params_and_buffers_to_ignore = {"pos_cis"}
-            self.model = DistributedDataParallel(
-                self.model, device_ids=[self.ddp_local_rank]
-            )
+            self.model = DistributedDataParallel(self.model, device_ids=[self.ddp_local_rank])
 
     def train_epoch(self, epoch):
         """Train for one epoch"""
@@ -245,9 +276,7 @@ class PreTrainer(TrainerBase):
             # Forward pass with mixed precision
             with self.ctx:
                 res = self.model(X)
-                loss = self.loss_fct(
-                    res.logits.view(-1, res.logits.size(-1)), Y.view(-1)
-                ).view(Y.size())
+                loss = self.loss_fct(res.logits.view(-1, res.logits.size(-1)), Y.view(-1)).view(Y.size())
                 loss = (loss * loss_mask).sum() / loss_mask.sum()
                 loss = loss / self.args.accumulation_steps
 
@@ -257,9 +286,7 @@ class PreTrainer(TrainerBase):
             # Update weights if accumulation steps reached
             if (step + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.args.grad_clip
-                )
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
@@ -269,15 +296,17 @@ class PreTrainer(TrainerBase):
                 self.log_progress(epoch, step, loss, start_time)
 
             # Save checkpoint
-            if (step + 1) % self.args.save_interval == 0 and (
-                not self.ddp or self.ddp_local_rank == 0
-            ):
+            if (step + 1) % self.args.save_interval == 0 and (not self.ddp or self.ddp_local_rank == 0):
                 self.save_checkpoint()
+
+    def get_predictions(self, dataset: Dataset):
+        raise NotImplementedError("Pretraining does not support prediction generation.")
 
 
 class SFTTrainer(TrainerBase):
     category: str = "sft"
     dataset_cls: type[Dataset] = SFTDataset
+    evaluator_cls: type[Evaluator] = CometEvaluator
 
     def setup_model(self):
         # Initialize model config
@@ -301,20 +330,14 @@ class SFTTrainer(TrainerBase):
 
     def setup_training(self):
         # Initialize optimizer, loss function, and scaler
-        self.optimizer = optim.AdamW(
-            self.model.parameters(), lr=self.args.learning_rate
-        )
-        self.scaler = torch.cuda.amp.GradScaler(
-            enabled=(self.args.dtype in ["float16", "bfloat16"])
-        )
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=self.args.learning_rate)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=(self.args.dtype in ["float16", "bfloat16"]))
         self.loss_fct = nn.CrossEntropyLoss(reduction="none")
 
         # Set up DDP model if needed
         if self.ddp:
             self.model._ddp_params_and_buffers_to_ignore = {"pos_cis"}
-            self.model = DistributedDataParallel(
-                self.model, device_ids=[self.ddp_local_rank]
-            )
+            self.model = DistributedDataParallel(self.model, device_ids=[self.ddp_local_rank])
 
     def train_epoch(self, epoch):
         """Train for one epoch"""
@@ -334,9 +357,7 @@ class SFTTrainer(TrainerBase):
             # Forward pass with mixed precision
             with self.ctx:
                 res = self.model(X)
-                loss = self.loss_fct(
-                    res.logits.view(-1, res.logits.size(-1)), Y.view(-1)
-                ).view(Y.size())
+                loss = self.loss_fct(res.logits.view(-1, res.logits.size(-1)), Y.view(-1)).view(Y.size())
                 loss = (loss * loss_mask).sum() / loss_mask.sum()
                 loss = loss / self.args.accumulation_steps
 
@@ -346,9 +367,7 @@ class SFTTrainer(TrainerBase):
             # Update weights if accumulation steps reached
             if (step + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.args.grad_clip
-                )
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
@@ -358,15 +377,12 @@ class SFTTrainer(TrainerBase):
                 self.log_progress(epoch, step, loss, start_time)
 
             # Save checkpoint
-            if (step + 1) % self.args.save_interval == 0 and (
-                not self.ddp or self.ddp_local_rank == 0
-            ):
+            if (step + 1) % self.args.save_interval == 0 and (not self.ddp or self.ddp_local_rank == 0):
                 self.save_checkpoint()
 
 
 class LoraTrainer(SFTTrainer):
     category: str = "lora"
-    dataset_cls: type[Dataset] = SFTDataset
 
     def setup_model(self):
         # Initialize model config
@@ -395,36 +411,26 @@ class LoraTrainer(SFTTrainer):
                 param.requires_grad = False
 
         # Collect LoRA parameters for optimization
-        self.lora_params = [
-            param for name, param in self.model.named_parameters() if "lora" in name
-        ]
+        self.lora_params = [param for name, param in self.model.named_parameters() if "lora" in name]
 
         # Log parameter statistics
         if not self.ddp or self.ddp_local_rank == 0:
             total_params = sum(p.numel() for p in self.model.parameters())
-            lora_params_count = sum(
-                p.numel() for name, p in self.model.named_parameters() if "lora" in name
-            )
+            lora_params_count = sum(p.numel() for name, p in self.model.named_parameters() if "lora" in name)
             self.log(f"LLM total parameters: {total_params:,}")
             self.log(f"LoRA parameters: {lora_params_count:,}")
-            self.log(
-                f"LoRA parameters ratio: {lora_params_count / total_params * 100:.2f}%"
-            )
+            self.log(f"LoRA parameters ratio: {lora_params_count / total_params * 100:.2f}%")
 
     def setup_training(self):
         # Initialize optimizer, loss function, and scaler
         self.optimizer = optim.AdamW(self.lora_params, lr=self.args.learning_rate)
-        self.scaler = torch.cuda.amp.GradScaler(
-            enabled=(self.args.dtype in ["float16", "bfloat16"])
-        )
+        self.scaler = torch.cuda.amp.GradScaler(enabled=(self.args.dtype in ["float16", "bfloat16"]))
         self.loss_fct = nn.CrossEntropyLoss(reduction="none")
 
         # Set up DDP model if needed
         if self.ddp:
             self.model._ddp_params_and_buffers_to_ignore = {"pos_cis"}
-            self.model = DistributedDataParallel(
-                self.model, device_ids=[self.ddp_local_rank]
-            )
+            self.model = DistributedDataParallel(self.model, device_ids=[self.ddp_local_rank])
 
     def train_epoch(self, epoch):
         """Train for one epoch"""
@@ -444,9 +450,7 @@ class LoraTrainer(SFTTrainer):
             # Forward pass with mixed precision
             with self.ctx:
                 res = self.model(X)
-                loss = self.loss_fct(
-                    res.logits.view(-1, res.logits.size(-1)), Y.view(-1)
-                ).view(Y.size())
+                loss = self.loss_fct(res.logits.view(-1, res.logits.size(-1)), Y.view(-1)).view(Y.size())
                 loss = (loss * loss_mask).sum() / loss_mask.sum()
                 loss = loss / self.args.accumulation_steps
 
@@ -466,15 +470,14 @@ class LoraTrainer(SFTTrainer):
                 self.log_progress(epoch, step, loss, start_time)
 
             # Save checkpoint
-            if (step + 1) % self.args.save_interval == 0 and (
-                not self.ddp or self.ddp_local_rank == 0
-            ):
+            if (step + 1) % self.args.save_interval == 0 and (not self.ddp or self.ddp_local_rank == 0):
                 self.save_checkpoint()
 
 
 class DPOTrainer(TrainerBase):
     category: str = "dpo"
     dataset_cls: type[Dataset] = DPODataset
+    evaluator_cls: type[Evaluator] = CometEvaluator
 
     def setup_model(self):
         # Initialize model config
@@ -503,19 +506,13 @@ class DPOTrainer(TrainerBase):
 
     def setup_training(self):
         # Initialize optimizer and scaler
-        self.optimizer = optim.AdamW(
-            self.model.parameters(), lr=self.args.learning_rate
-        )
-        self.scaler = torch.cuda.amp.GradScaler(
-            enabled=(self.args.dtype in ["float16", "bfloat16"])
-        )
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=self.args.learning_rate)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=(self.args.dtype in ["float16", "bfloat16"]))
 
         # Set up DDP model if needed
         if self.ddp:
             self.model._ddp_params_and_buffers_to_ignore = {"pos_cis"}
-            self.model = DistributedDataParallel(
-                self.model, device_ids=[self.ddp_local_rank]
-            )
+            self.model = DistributedDataParallel(self.model, device_ids=[self.ddp_local_rank])
 
     def train_epoch(self, epoch):
         """Train for one epoch"""
@@ -566,9 +563,7 @@ class DPOTrainer(TrainerBase):
             # Update weights if accumulation steps reached
             if (step + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.args.grad_clip
-                )
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
@@ -578,7 +573,5 @@ class DPOTrainer(TrainerBase):
                 self.log_progress(epoch, step, loss, start_time)
 
             # Save checkpoint
-            if (step + 1) % self.args.save_interval == 0 and (
-                not self.ddp or self.ddp_local_rank == 0
-            ):
+            if (step + 1) % self.args.save_interval == 0 and (not self.ddp or self.ddp_local_rank == 0):
                 self.save_checkpoint()

@@ -1,27 +1,32 @@
 import json
-from torch.utils.data import Dataset
-import torch
 import os
+
+import torch
+from torch.utils.data import Dataset
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+
 class PretrainDataset(Dataset):
-    def __init__(self, data_path, tokenizer, max_length=512):
+    def __init__(self, file_path, tokenizer, max_length=512):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.samples = self.load_data(data_path)
+        self.samples = self.load_data(file_path)
 
     def load_data(self, path):
         samples = []
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             for line_num, line in enumerate(f, 1):
                 data = json.loads(line.strip())
                 samples.append(data)
         return samples
 
-    def __len__(self):
-        return len(self.samples)
+    def get_sources(self):
+        raise NotImplementedError("get_sources method is not implemented for PretrainDataset")
+
+    def get_references(self):
+        raise NotImplementedError("get_references method is not implemented for PretrainDataset")
 
     def __getitem__(self, index):
         sample = self.samples[index]
@@ -43,21 +48,23 @@ class PretrainDataset(Dataset):
         loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)
         return X, Y, loss_mask
 
-class SFTDataset(Dataset):
-    def __init__(self, jsonl_path, tokenizer, max_length=1024):
-        super().__init__()
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.samples = self.load_data(jsonl_path)
-        self.bos_id = tokenizer("<s>assistant\n", add_special_tokens=False).input_ids
-        self.eos_id = tokenizer("</s>\n", add_special_tokens=False).input_ids
-
     def __len__(self):
         return len(self.samples)
 
-    def load_data(self, path):
+
+class SFTDataset(Dataset):
+    def __init__(self, file_path, tokenizer, max_length=1024):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.samples = self.load_data(file_path)
+        self.bos_id = tokenizer("<s>assistant\n", add_special_tokens=False).input_ids
+        self.eos_id = tokenizer("</s>\n", add_special_tokens=False).input_ids
+        self.prompt_length = 65
+
+    def load_data(self, file_path):
         samples = []
-        with open(path, "r", encoding="utf-8") as f:
+        with open(file_path, encoding="utf-8") as f:
             for line_num, line in enumerate(f, 1):
                 data = json.loads(line.strip())
                 samples.append(data)
@@ -89,6 +96,27 @@ class SFTDataset(Dataset):
                 i += 1
         return loss_mask
 
+    def get_sources(self):
+        sources = []
+        for sample in self.samples:
+            conversations = sample["conversations"]
+            source = conversations[0]["content"][self.prompt_length :].strip()
+            sources.append(source)
+        return sources
+
+    def get_references(self):
+        references = []
+        for sample in self.samples:
+            conversations = sample["conversations"]
+            reference = conversations[1]["content"].strip()
+            references.append(reference)
+        return references
+
+    @property
+    def messages_lst(self):
+        for sample in self.samples:
+            yield sample["conversations"][0]
+
     def __getitem__(self, index):
         sample = self.samples[index]
         # Build dialogue prompt
@@ -106,6 +134,10 @@ class SFTDataset(Dataset):
 
         return X, Y, loss_mask
 
+    def __len__(self):
+        return len(self.samples)
+
+
 class DPODataset(Dataset):
     def __init__(self, file_path, tokenizer, max_length=4096):
         super().__init__()
@@ -114,18 +146,59 @@ class DPODataset(Dataset):
         self.padding = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
         self.bos_id = tokenizer("<s>assistant\n", add_special_tokens=False).input_ids
         self.eos_id = tokenizer("</s>\n", add_special_tokens=False).input_ids
-        with open(file_path, "r", encoding="utf-8") as f:
-            self.data = []
+        self.samples = self.load_data(file_path)
+        self.prompt_length = 65
+
+    def load_data(self, file_path):
+        samples = []
+        with open(file_path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 obj = json.loads(line)
-                self.data.append(obj)
+                samples.append(obj)
+        return samples
 
-    def __len__(self):
-        return len(self.data)
+    def _generate_loss_mask(self, input_ids):
+        loss_mask = [0] * len(input_ids)
+        i = 0
+        while i < len(input_ids):
+            if input_ids[i : i + len(self.bos_id)] == self.bos_id:
+                start = i + len(self.bos_id)
+                end = start
+                while end < len(input_ids):
+                    if input_ids[end : end + len(self.eos_id)] == self.eos_id:
+                        break
+                    end += 1
+                for j in range(start + 1, min(end + len(self.eos_id) + 1, self.max_length)):
+                    loss_mask[j] = 1
+                i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
+            else:
+                i += 1
+        return loss_mask
+
+    def get_sources(self):
+        sources = []
+        for sample in self.samples:
+            chosen = sample["chosen"]
+            source = chosen[0]["content"][self.prompt_length :].strip()
+            sources.append(source)
+        return sources
+
+    def get_references(self):
+        references = []
+        for sample in self.samples:
+            chosen = sample["chosen"]
+            reference = chosen[1]["content"].strip()
+            references.append(reference)
+        return references
+
+    @property
+    def messages_lst(self):
+        for sample in self.samples:
+            yield sample["chosen"][0]
 
     def __getitem__(self, index):
-        item = self.data[index]
+        item = self.samples[index]
         chosen = item["chosen"]  # A list containing multiple {role, content} pairs
         rejected = item["rejected"]  # Same as above
         chosen_prompt = self.tokenizer.apply_chat_template(chosen, tokenize=False, add_generation_prompt=False)
@@ -164,21 +237,5 @@ class DPODataset(Dataset):
             "mask_rejected": mask_rejected,
         }
 
-    def _generate_loss_mask(self, input_ids):
-        loss_mask = [0] * len(input_ids)
-        i = 0
-        while i < len(input_ids):
-            if input_ids[i : i + len(self.bos_id)] == self.bos_id:
-                start = i + len(self.bos_id)
-                end = start
-                while end < len(input_ids):
-                    if input_ids[end : end + len(self.eos_id)] == self.eos_id:
-                        break
-                    end += 1
-                for j in range(start + 1, min(end + len(self.eos_id) + 1, self.max_length)):
-                    loss_mask[j] = 1
-                i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
-            else:
-                i += 1
-        return loss_mask
-
+    def __len__(self):
+        return len(self.samples)

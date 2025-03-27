@@ -1,11 +1,10 @@
-import math
-from .config import LMConfig
-from typing import Optional, Tuple, List
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
+
+from .config import LMConfig
 
 
 class RMSNorm(torch.nn.Module):
@@ -27,7 +26,6 @@ class RMSNorm(torch.nn.Module):
             torch.Tensor: Normalized tensor of the same shape as x
         """
         # Write your code here
-        pass
 
 
 def precompute_pos_cis(dim: int, end: int = int(32 * 1024), theta: float = 1e6):
@@ -91,9 +89,9 @@ class Attention(nn.Module):
         self,
         x: torch.Tensor,
         pos_cis: torch.Tensor,
-        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
         use_cache=False,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         """
         Implement the forward pass of the attention layer.
 
@@ -141,9 +139,7 @@ class FeedForward(nn.Module):
         if config.hidden_dim is None:
             hidden_dim = 4 * config.dim
             hidden_dim = int(2 * hidden_dim / 3)
-            config.hidden_dim = config.multiple_of * (
-                (hidden_dim + config.multiple_of - 1) // config.multiple_of
-            )
+            config.hidden_dim = config.multiple_of * ((hidden_dim + config.multiple_of - 1) // config.multiple_of)
         self.w1 = nn.Linear(config.dim, config.hidden_dim, bias=False)
         self.w2 = nn.Linear(config.hidden_dim, config.dim, bias=False)
         self.w3 = nn.Linear(config.dim, config.hidden_dim, bias=False)
@@ -187,25 +183,21 @@ class MiniMindLM(PreTrainedModel):
         self.vocab_size, self.n_layers = params.vocab_size, params.n_layers
         self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
         self.dropout = nn.Dropout(params.dropout)
-        self.layers = nn.ModuleList(
-            [MiniMindBlock(layer, params) for layer in range(self.n_layers)]
-        )
+        self.layers = nn.ModuleList([MiniMindBlock(layer, params) for layer in range(self.n_layers)])
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
         self.tok_embeddings.weight = self.output.weight
         self.register_buffer(
             "pos_cis",
-            precompute_pos_cis(
-                dim=params.dim // params.n_heads, theta=params.rope_theta
-            ),
+            precompute_pos_cis(dim=params.dim // params.n_heads, theta=params.rope_theta),
             persistent=False,
         )
         self.OUT = CausalLMOutputWithPast()
 
     def forward(
         self,
-        input_ids: Optional[torch.Tensor] = None,
-        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        input_ids: torch.Tensor | None = None,
+        past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         use_cache: bool = False,
         **args,
     ):
@@ -215,9 +207,7 @@ class MiniMindLM(PreTrainedModel):
         pos_cis = self.pos_cis[start_pos : start_pos + input_ids.size(1)]
         past_kvs = []
         for layer, layer in enumerate(self.layers):
-            h, past_kv = layer(
-                h, pos_cis, past_key_value=past_key_values[layer], use_cache=use_cache
-            )
+            h, past_kv = layer(h, pos_cis, past_key_value=past_key_values[layer], use_cache=use_cache)
             past_kvs.append(past_kv)
         logits = self.output(self.norm(h))
         self.OUT.__setitem__("logits", logits)
@@ -302,9 +292,7 @@ class MiniMindLM(PreTrainedModel):
         while input_ids.shape[1] < max_new_tokens - 1:
             if first_seq or not use_cache:
                 out, first_seq = (
-                    self(
-                        input_ids, past_key_values=past_kvs, use_cache=use_cache, **args
-                    ),
+                    self(input_ids, past_key_values=past_kvs, use_cache=use_cache, **args),
                     False,
                 )
             else:
@@ -319,19 +307,13 @@ class MiniMindLM(PreTrainedModel):
             logits[:, list(set(input_ids.tolist()[0]))] /= rp
             logits /= temperature + 1e-9
             if top_p is not None and top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(
-                    logits, descending=True, dim=-1
-                )
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
                 sorted_probs = F.softmax(sorted_logits, dim=-1)
                 cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
                 sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[
-                    :, :-1
-                ].clone()
+                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
                 sorted_indices_to_remove[:, 0] = False
-                indices_to_remove = sorted_indices_to_remove.scatter(
-                    1, sorted_indices, sorted_indices_to_remove
-                )
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
                 logits[indices_to_remove] = -float("Inf")
             input_ids_next = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
             input_ids = torch.cat((input_ids, input_ids_next), dim=1)

@@ -1,7 +1,8 @@
 import argparse
-
 import warnings
+
 import torch
+
 from trainer import PreTrainer
 
 warnings.filterwarnings("ignore")
@@ -31,7 +32,9 @@ def parse_args():
     parser.add_argument("--data_path", type=str, default="./data/pretrain.jsonl")
 
     args = parser.parse_args()
-    args.wandb_run_name = f"MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+    args.wandb_run_name = (
+        f"MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+    )
 
     return args
 
@@ -40,6 +43,7 @@ def main():
     args = parse_args()
     trainer = PreTrainer(args)
     trainer.run()
+    trainer.eval()
 
 
 if __name__ == "__main__":
