@@ -22,10 +22,10 @@ class PretrainDataset(Dataset):
                 samples.append(data)
         return samples
 
-    def get_sources(self):
+    def get_sources(self, samples):
         raise NotImplementedError("get_sources method is not implemented for PretrainDataset")
 
-    def get_references(self):
+    def get_references(self, samples):
         raise NotImplementedError("get_references method is not implemented for PretrainDataset")
 
     def __getitem__(self, index):
@@ -96,26 +96,24 @@ class SFTDataset(Dataset):
                 i += 1
         return loss_mask
 
-    def get_sources(self):
+    def get_sources(self, samples):
         sources = []
-        for sample in self.samples:
+        for sample in samples:
             conversations = sample["conversations"]
             source = conversations[0]["content"][self.prompt_length :].strip()
             sources.append(source)
         return sources
 
-    def get_references(self):
+    def get_references(self, samples):
         references = []
-        for sample in self.samples:
+        for sample in samples:
             conversations = sample["conversations"]
             reference = conversations[1]["content"].strip()
             references.append(reference)
         return references
 
-    @property
-    def messages_lst(self):
-        for sample in self.samples:
-            yield sample["conversations"][0]
+    def extract_messages(self, sample):
+        return sample["conversations"][0]
 
     def __getitem__(self, index):
         sample = self.samples[index]
@@ -176,26 +174,24 @@ class DPODataset(Dataset):
                 i += 1
         return loss_mask
 
-    def get_sources(self):
+    def get_sources(self, samples):
         sources = []
-        for sample in self.samples:
+        for sample in samples:
             chosen = sample["chosen"]
             source = chosen[0]["content"][self.prompt_length :].strip()
             sources.append(source)
         return sources
 
-    def get_references(self):
+    def get_references(self, samples):
         references = []
-        for sample in self.samples:
+        for sample in samples:
             chosen = sample["chosen"]
             reference = chosen[1]["content"].strip()
             references.append(reference)
         return references
 
-    @property
-    def messages_lst(self):
-        for sample in self.samples:
-            yield sample["chosen"][0]
+    def extract_messages(self, sample):
+        return sample["chosen"][0]
 
     def __getitem__(self, index):
         item = self.samples[index]
