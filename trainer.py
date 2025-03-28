@@ -190,14 +190,14 @@ class TrainerBase:
         """Evaluate the model"""
         self.evaluator.eval()
 
-    def get_predictions(self, dataset: Dataset):
+    def get_predictions(self, messages_lst):
         """
         Get predictions from the model
         """
         self.model.eval()
         predictions: list[str] = []
         with torch.no_grad():
-            for messages in dataset.messages_lst:
+            for messages in messages_lst:
                 prompt = self.tokenizer.apply_chat_template(
                     messages,
                     tokenize=False,
@@ -325,7 +325,7 @@ class PreTrainer(TrainerBase):
         if not self.ddp or self.ddp_local_rank == 0:
             self.save_checkpoint(epoch=epoch)
 
-    def get_predictions(self, dataset: Dataset):
+    def get_predictions(self, messages_lst):
         raise NotImplementedError("Pretraining does not support prediction generation.")
 
 
