@@ -45,6 +45,7 @@ def dpo_loss(ref_probs: torch.Tensor, probs: torch.Tensor, beta: float = 0.1) ->
 
 
 class TrainerBase:
+    prev_category: str
     category: str
     dataset_cls: type[Dataset]
     evaluator_cls: type[Evaluator]
@@ -58,12 +59,7 @@ class TrainerBase:
         self.setup_dataloader()
         self.setup_evaluator()
         self.setup_training()
-        self.try_load_checkpoint()
-
-    def try_load_checkpoint(self):
-        """Load checkpoint if specified"""
-        if self.args.resume_from_checkpoint:
-            self.load_checkpoint()
+        self.load_checkpoint()
 
     def setup_environment(self):
         # Set up DDP if enabled
@@ -104,7 +100,18 @@ class TrainerBase:
             print(content)
 
     def setup_model(self):
-        raise NotImplementedError
+        # Initialize model and tokenizer
+        self.lm_config = LMConfig(
+            dim=self.args.dim,
+            n_layers=self.args.n_layers,
+            max_seq_len=self.args.max_seq_len,
+        )
+
+        # Load tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained("./model/tokenizer")
+
+        # Build model
+        self.model = MiniMindLM(self.lm_config).to(self.args.device)
 
     def setup_dataloader(self):
         # Set up dataset and dataloader
@@ -149,7 +156,16 @@ class TrainerBase:
         self.evaluator = self.evaluator_cls(self)
 
     def setup_training(self):
-        raise NotImplementedError
+        # Initialize optimizer, loss function, and scaler
+        self.model_parameters = self.model.parameters()
+        self.optimizer = optim.AdamW(self.model_parameters, lr=self.args.learning_rate)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=(self.args.dtype in ["float16", "bfloat16"]))
+        self.loss_fct = nn.CrossEntropyLoss(reduction="none")
+
+        # Set up DDP model if needed
+        if self.ddp:
+            self.model._ddp_params_and_buffers_to_ignore = {"pos_cis"}
+            self.model = DistributedDataParallel(self.model, device_ids=[self.ddp_local_rank])
 
     def get_lr(self, current_step, total_steps):
         """Calculate learning rate with cosine decay schedule"""
@@ -158,7 +174,44 @@ class TrainerBase:
 
     def train_epoch(self, epoch):
         """Train for one epoch"""
-        raise NotImplementedError
+        start_time = time.time()
+        for step, (X, Y, loss_mask) in enumerate(self.train_loader):
+            X = X.to(self.args.device)
+            Y = Y.to(self.args.device)
+            loss_mask = loss_mask.to(self.args.device)
+
+            # Update learning rate
+            current_step = epoch * self.iter_per_epoch + step
+            total_steps = self.args.epochs * self.iter_per_epoch
+            lr = self.get_lr(current_step, total_steps)
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] = lr
+
+            # Forward pass with mixed precision
+            with self.ctx:
+                res = self.model(X)
+                loss = self.loss_fct(res.logits.view(-1, res.logits.size(-1)), Y.view(-1)).view(Y.size())
+                loss = (loss * loss_mask).sum() / loss_mask.sum()
+                loss = loss / self.args.accumulation_steps
+
+            # Backward pass with gradient scaling
+            self.scaler.scale(loss).backward()
+
+            # Update weights if accumulation steps reached
+            if (step + 1) % self.args.accumulation_steps == 0:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model_parameters, self.args.grad_clip)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad(set_to_none=True)
+
+            # Logging
+            if step % self.args.log_interval == 0:
+                self.log_progress(epoch, step, loss, start_time)
+
+        # Save checkpoint at epoch end
+        if not self.ddp or self.ddp_local_rank == 0:
+            self.save_checkpoint(epoch=epoch)
 
     def log_progress(self, epoch, step, loss, start_time):
         """Log training progress"""
@@ -199,7 +252,7 @@ class TrainerBase:
         with torch.no_grad():
             for messages in messages_lst:
                 prompt = self.tokenizer.apply_chat_template(
-                    messages,
+                    [messages],
                     tokenize=False,
                     add_generation_prompt=True,
                 )[-self.args.max_seq_len + 1 :]
@@ -223,19 +276,29 @@ class TrainerBase:
 
     def load_checkpoint(self):
         """Load model checkpoint for continuing training"""
-        if os.path.isfile(self.args.resume_from_checkpoint):
-            self.log(f"Loading checkpoint from {self.args.resume_from_checkpoint}")
-            self.checkpoint = torch.load(self.args.resume_from_checkpoint, map_location=self.args.device)
+        prev_ckp = f"{self.args.out_dir}/{self.prev_category}_{self.lm_config.dim}.pth"
+        curr_ckp = f"{self.args.out_dir}/{self.category}_{self.lm_config.dim}.pth"
 
-            # Load each component of the checkpoint
-            self.model.load_state_dict(self.checkpoint["model_state_dict"])
-            self.optimizer.load_state_dict(self.checkpoint["optimizer"])
-            self.scaler.load_state_dict(self.checkpoint["scaler"])
-            self.start_epoch = self.checkpoint["epoch"] + 1
-            self.log("Checkpoint loaded successfully")
+        if os.path.isfile(curr_ckp):
+            self.log(f"Loading checkpoint from {curr_ckp}")
+            self._load_checkpoint_from_continue_training(curr_ckp)
+            self.log(f"Checkpoint {curr_ckp} loaded successfully")
         else:
-            self.start_epoch = 0
-            self.log(f"No checkpoint found at {self.args.resume_from_checkpoint}")
+            self.log(f"Loading checkpoint from {prev_ckp}")
+            self._load_checkpoint_from_prev_stage(prev_ckp)
+            self.log(f"Checkpoint {prev_ckp} loaded successfully")
+
+    def _load_checkpoint_from_continue_training(self, ckp):
+        checkpoint = torch.load(ckp, map_location=self.args.device)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer"])
+        self.scaler.load_state_dict(checkpoint["scaler"])
+        self.start_epoch = checkpoint["epoch"] + 1
+
+    def _load_checkpoint_from_prev_stage(self, ckp):
+        checkpoint = torch.load(ckp, map_location=self.args.device)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.start_epoch = 0
 
     def save_checkpoint(self, epoch):
         """Save model checkpoint with training state"""
@@ -255,9 +318,55 @@ class TrainerBase:
 
 
 class PreTrainer(TrainerBase):
+    prev_category = ""
     category: str = "pretrain"
     dataset_cls: type[Dataset] = PretrainDataset
     evaluator_cls: type[Evaluator] = PerplexityEvaluator
+
+    def _load_checkpoint_from_prev_stage(self, ckp):
+        # No previous stage checkpoint for pretraining
+        self.start_epoch = 0
+
+    def get_predictions(self, messages_lst):
+        raise NotImplementedError("Pretraining does not support prediction generation.")
+
+
+class SFTTrainer(TrainerBase):
+    prev_category: str = "pretrain"
+    category: str = "sft"
+    dataset_cls: type[Dataset] = SFTDataset
+    evaluator_cls: type[Evaluator] = CometEvaluator
+
+
+class LoraTrainer(SFTTrainer):
+    prev_category: str = "sft"
+    category: str = "lora"
+
+    def setup_model(self):
+        super().setup_model()
+
+        # Apply lora
+        self.model = apply_lora(self.model, self.args.lora_rank)
+
+        # Freeze non-LoRA parameters
+        for name, param in self.model.named_parameters():
+            if "lora" not in name:
+                param.requires_grad = False
+
+        # Collect LoRA parameters for optimization
+        self.model_parameters = [param for name, param in self.model.named_parameters() if "lora" in name]
+
+        # Log parameter statistics
+        if not self.ddp or self.ddp_local_rank == 0:
+            lora_params_count = sum(p.numel() for p in self.model_parameters)
+            self.log(f"LoRA parameters: {lora_params_count:,}")
+
+
+class DPOTrainer(TrainerBase):
+    prev_category: str = "sft"
+    category: str = "dpo"
+    dataset_cls: type[Dataset] = DPODataset
+    evaluator_cls: type[Evaluator] = CometEvaluator
 
     def setup_model(self):
         # Initialize model and tokenizer
@@ -272,273 +381,25 @@ class PreTrainer(TrainerBase):
 
         # Build model
         self.model = MiniMindLM(self.lm_config).to(self.args.device)
+        self.ref_model = MiniMindLM(self.lm_config).to(self.args.device)
 
-    def setup_training(self):
-        # Initialize optimizer, loss function, and scaler
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=self.args.learning_rate)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=(self.args.dtype in ["float16", "bfloat16"]))
-        self.loss_fct = nn.CrossEntropyLoss(reduction="none")
-
-        # Set up DDP model if needed
-        if self.ddp:
-            self.model._ddp_params_and_buffers_to_ignore = {"pos_cis"}
-            self.model = DistributedDataParallel(self.model, device_ids=[self.ddp_local_rank])
-
-    def train_epoch(self, epoch):
-        """Train for one epoch"""
-        start_time = time.time()
-        for step, (X, Y, loss_mask) in enumerate(self.train_loader):
-            X = X.to(self.args.device)
-            Y = Y.to(self.args.device)
-            loss_mask = loss_mask.to(self.args.device)
-
-            # Update learning rate
-            current_step = epoch * self.iter_per_epoch + step
-            total_steps = self.args.epochs * self.iter_per_epoch
-            lr = self.get_lr(current_step, total_steps)
-            for param_group in self.optimizer.param_groups:
-                param_group["lr"] = lr
-
-            # Forward pass with mixed precision
-            with self.ctx:
-                res = self.model(X)
-                loss = self.loss_fct(res.logits.view(-1, res.logits.size(-1)), Y.view(-1)).view(Y.size())
-                loss = (loss * loss_mask).sum() / loss_mask.sum()
-                loss = loss / self.args.accumulation_steps
-
-            # Backward pass with gradient scaling
-            self.scaler.scale(loss).backward()
-
-            # Update weights if accumulation steps reached
-            if (step + 1) % self.args.accumulation_steps == 0:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                self.optimizer.zero_grad(set_to_none=True)
-
-            # Logging
-            if step % self.args.log_interval == 0:
-                self.log_progress(epoch, step, loss, start_time)
-
-        # Save checkpoint at epoch end
-        if not self.ddp or self.ddp_local_rank == 0:
-            self.save_checkpoint(epoch=epoch)
-
-    def get_predictions(self, messages_lst):
-        raise NotImplementedError("Pretraining does not support prediction generation.")
-
-
-class SFTTrainer(TrainerBase):
-    category: str = "sft"
-    dataset_cls: type[Dataset] = SFTDataset
-    evaluator_cls: type[Evaluator] = CometEvaluator
-
-    def setup_model(self):
-        # Initialize model config
-        self.lm_config = LMConfig(
-            dim=self.args.dim,
-            n_layers=self.args.n_layers,
-            max_seq_len=self.args.max_seq_len,
-        )
-
-        # Load tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained("./model/tokenizer")
-
-        # Build model
-        self.model = MiniMindLM(self.lm_config)
-
-        # Load model weight
-        ckp = f"{self.args.out_dir}/pretrain_{self.lm_config.dim}.pth"
+    def _load_checkpoint_from_prev_stage(self, ckp):
         state_dict = torch.load(ckp, map_location=self.args.device)
-        self.model.load_state_dict(state_dict, strict=False)
-        self.model.to(self.args.device)
-
-    def setup_training(self):
-        # Initialize optimizer, loss function, and scaler
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=self.args.learning_rate)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=(self.args.dtype in ["float16", "bfloat16"]))
-        self.loss_fct = nn.CrossEntropyLoss(reduction="none")
-
-        # Set up DDP model if needed
-        if self.ddp:
-            self.model._ddp_params_and_buffers_to_ignore = {"pos_cis"}
-            self.model = DistributedDataParallel(self.model, device_ids=[self.ddp_local_rank])
-
-    def train_epoch(self, epoch):
-        """Train for one epoch"""
-        start_time = time.time()
-        for step, (X, Y, loss_mask) in enumerate(self.train_loader):
-            X = X.to(self.args.device)
-            Y = Y.to(self.args.device)
-            loss_mask = loss_mask.to(self.args.device)
-
-            # Update learning rate
-            current_step = epoch * self.iter_per_epoch + step
-            total_steps = self.args.epochs * self.iter_per_epoch
-            lr = self.get_lr(current_step, total_steps)
-            for param_group in self.optimizer.param_groups:
-                param_group["lr"] = lr
-
-            # Forward pass with mixed precision
-            with self.ctx:
-                res = self.model(X)
-                loss = self.loss_fct(res.logits.view(-1, res.logits.size(-1)), Y.view(-1)).view(Y.size())
-                loss = (loss * loss_mask).sum() / loss_mask.sum()
-                loss = loss / self.args.accumulation_steps
-
-            # Backward pass with gradient scaling
-            self.scaler.scale(loss).backward()
-
-            # Update weights if accumulation steps reached
-            if (step + 1) % self.args.accumulation_steps == 0:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                self.optimizer.zero_grad(set_to_none=True)
-
-            # Logging
-            if step % self.args.log_interval == 0:
-                self.log_progress(epoch, step, loss, start_time)
-
-        # Save checkpoint at epoch end
-        if not self.ddp or self.ddp_local_rank == 0:
-            self.save_checkpoint(epoch=epoch)
-
-
-class LoraTrainer(SFTTrainer):
-    category: str = "lora"
-
-    def setup_model(self):
-        # Initialize model config
-        self.lm_config = LMConfig(
-            dim=self.args.dim,
-            n_layers=self.args.n_layers,
-            max_seq_len=self.args.max_seq_len,
-        )
-
-        # Load tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained("./model/tokenizer")
-
-        # Build model
-        self.model = MiniMindLM(self.lm_config)
-
-        # Load model weight
-        ckp = f"{self.args.out_dir}/sft_{self.lm_config.dim}.pth"
-        state_dict = torch.load(ckp, map_location=self.args.device)
-        self.model.load_state_dict(state_dict, strict=False)
-        self.model.to(self.args.device)
-        self.model = apply_lora(self.model, self.args.lora_rank)
-
-        # Freeze non-LoRA parameters
-        for name, param in self.model.named_parameters():
-            if "lora" not in name:
-                param.requires_grad = False
-
-        # Collect LoRA parameters for optimization
-        self.lora_params = [param for name, param in self.model.named_parameters() if "lora" in name]
-
-        # Log parameter statistics
-        if not self.ddp or self.ddp_local_rank == 0:
-            total_params = sum(p.numel() for p in self.model.parameters())
-            lora_params_count = sum(p.numel() for name, p in self.model.named_parameters() if "lora" in name)
-            self.log(f"LLM total parameters: {total_params:,}")
-            self.log(f"LoRA parameters: {lora_params_count:,}")
-            self.log(f"LoRA parameters ratio: {lora_params_count / total_params * 100:.2f}%")
-
-    def setup_training(self):
-        # Initialize optimizer, loss function, and scaler
-        self.optimizer = optim.AdamW(self.lora_params, lr=self.args.learning_rate)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=(self.args.dtype in ["float16", "bfloat16"]))
-        self.loss_fct = nn.CrossEntropyLoss(reduction="none")
-
-        # Set up DDP model if needed
-        if self.ddp:
-            self.model._ddp_params_and_buffers_to_ignore = {"pos_cis"}
-            self.model = DistributedDataParallel(self.model, device_ids=[self.ddp_local_rank])
-
-    def train_epoch(self, epoch):
-        """Train for one epoch"""
-        start_time = time.time()
-        for step, (X, Y, loss_mask) in enumerate(self.train_loader):
-            X = X.to(self.args.device)
-            Y = Y.to(self.args.device)
-            loss_mask = loss_mask.to(self.args.device)
-
-            # Update learning rate
-            current_step = epoch * self.iter_per_epoch + step
-            total_steps = self.args.epochs * self.iter_per_epoch
-            lr = self.get_lr(current_step, total_steps)
-            for param_group in self.optimizer.param_groups:
-                param_group["lr"] = lr
-
-            # Forward pass with mixed precision
-            with self.ctx:
-                res = self.model(X)
-                loss = self.loss_fct(res.logits.view(-1, res.logits.size(-1)), Y.view(-1)).view(Y.size())
-                loss = (loss * loss_mask).sum() / loss_mask.sum()
-                loss = loss / self.args.accumulation_steps
-
-            # Backward pass with gradient scaling
-            self.scaler.scale(loss).backward()
-
-            # Update weights if accumulation steps reached
-            if (step + 1) % self.args.accumulation_steps == 0:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.lora_params, self.args.grad_clip)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                self.optimizer.zero_grad(set_to_none=True)
-
-            # Logging
-            if step % self.args.log_interval == 0:
-                self.log_progress(epoch, step, loss, start_time)
-
-        # Save checkpoint at epoch end
-        if not self.ddp or self.ddp_local_rank == 0:
-            self.save_checkpoint(epoch=epoch)
-
-
-class DPOTrainer(TrainerBase):
-    category: str = "dpo"
-    dataset_cls: type[Dataset] = DPODataset
-    evaluator_cls: type[Evaluator] = CometEvaluator
-
-    def setup_model(self):
-        # Initialize model config
-        self.lm_config = LMConfig(
-            dim=self.args.dim,
-            n_layers=self.args.n_layers,
-            max_seq_len=self.args.max_seq_len,
-        )
-
-        # Load tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained("./model/tokenizer")
-
-        # Initialize policy model
-        self.model = MiniMindLM(self.lm_config)
-        ckp = f"{self.args.out_dir}/lora_{self.lm_config.dim}.pth"
-        state_dict = torch.load(ckp, map_location=self.args.device)
-        self.model.load_state_dict(state_dict, strict=False)
-        self.model.to(self.args.device)
-
-        # Initialize reference model (frozen copy of policy model)
-        self.ref_model = MiniMindLM(self.lm_config)
-        self.ref_model.load_state_dict(state_dict, strict=False)
+        self.model.load_state_dict(state_dict["model_state_dict"], strict=False)
+        self.ref_model.load_state_dict(state_dict["model_state_dict"], strict=False)
         self.ref_model.eval()
         self.ref_model.requires_grad_(False)
-        self.ref_model.to(self.args.device)
+        self.start_epoch = 0
 
-    def setup_training(self):
-        # Initialize optimizer and scaler
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=self.args.learning_rate)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=(self.args.dtype in ["float16", "bfloat16"]))
-
-        # Set up DDP model if needed
-        if self.ddp:
-            self.model._ddp_params_and_buffers_to_ignore = {"pos_cis"}
-            self.model = DistributedDataParallel(self.model, device_ids=[self.ddp_local_rank])
+    def _load_checkpoint_from_continue_training(self, ckp):
+        checkpoint = torch.load(ckp, map_location=self.args.device)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.ref_model.load_state_dict(checkpoint["ref_model_state_dict"])
+        self.ref_model.eval()
+        self.ref_model.requires_grad_(False)
+        self.optimizer.load_state_dict(checkpoint["optimizer"])
+        self.scaler.load_state_dict(checkpoint["scaler"])
+        self.start_epoch = checkpoint["epoch"] + 1
 
     def train_epoch(self, epoch):
         """Train for one epoch"""
@@ -589,7 +450,7 @@ class DPOTrainer(TrainerBase):
             # Update weights if accumulation steps reached
             if (step + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
+                torch.nn.utils.clip_grad_norm_(self.model_parameters, self.args.grad_clip)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
@@ -601,3 +462,20 @@ class DPOTrainer(TrainerBase):
         # Save checkpoint at epoch end
         if not self.ddp or self.ddp_local_rank == 0:
             self.save_checkpoint(epoch=epoch)
+
+    def save_checkpoint(self, epoch):
+        """Save model checkpoint with training state"""
+        self.model.eval()
+        checkpoint = {
+            "model_state_dict": self.model.module.state_dict() if self.ddp else self.model.state_dict(),
+            "ref_model_state_dict": self.ref_model.module.state_dict() if self.ddp else self.ref_model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "scaler": self.scaler.state_dict() if self.scaler is not None else None,
+            "epoch": epoch,
+        }
+
+        checkpoint_path = f"{self.args.out_dir}/{self.category}_{self.lm_config.dim}.pth"
+        torch.save(checkpoint, checkpoint_path)
+
+        self.log(f"Checkpoint saved to {checkpoint_path}")
+        self.model.train()
