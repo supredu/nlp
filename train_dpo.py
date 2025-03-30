@@ -11,6 +11,8 @@ warnings.filterwarnings("ignore")
 def parse_args():
     parser = argparse.ArgumentParser(description="MiniMind RLHF")
     parser.add_argument("--out_dir", type=str, default="out")
+    parser.add_argument("--temperature", default=0.85, type=float)
+    parser.add_argument("--top_p", default=0.85, type=float)
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch_size", type=int, default=8)
     # SFT stage learning rate is "5e-6"->"5e-7" for length 512
