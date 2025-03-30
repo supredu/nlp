@@ -11,6 +11,8 @@ warnings.filterwarnings("ignore")
 def parse_args():
     parser = argparse.ArgumentParser(description="MiniMind Full SFT")
     parser.add_argument("--out_dir", type=str, default="out")
+    parser.add_argument("--temperature", default=0.85, type=float)
+    parser.add_argument("--top_p", default=0.85, type=float)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
