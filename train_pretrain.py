@@ -30,7 +30,6 @@ def parse_args():
     parser.add_argument("--n_layers", default=8, type=int)
     parser.add_argument("--max_seq_len", default=512, type=int)
     parser.add_argument("--data_path", type=str, default="./data/pretrain.jsonl")
-    parser.add_argument("--resume_from_checkpoint", type=str, default=None)
 
     args = parser.parse_args()
     args.wandb_run_name = (
