@@ -263,7 +263,7 @@ class TrainerBase:
                     max_new_tokens=self.args.max_seq_len,
                     temperature=self.args.temperature,
                     top_p=self.args.top_p,
-                    stream=True,
+                    stream=False,
                     pad_token_id=self.tokenizer.pad_token_id,
                 )
                 prediction = self.tokenizer.decode(
