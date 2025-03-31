@@ -81,7 +81,7 @@ class Attention(nn.Module):
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
 
-        mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
+        mask = torch.full((1, 1, args.model_max_length, args.model_max_length), float("-inf"))
         mask = torch.triu(mask, diagonal=1)
         self.register_buffer("mask", mask, persistent=False)
 

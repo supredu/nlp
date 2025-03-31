@@ -15,6 +15,7 @@ class LMConfig(PretrainedConfig):
         multiple_of: int = 64,
         norm_eps: float = 1e-5,
         max_seq_len: int = 8192,
+        model_max_length: int = 8192,
         rope_theta: int = 1e6,
         dropout: float = 0.0,
         **kwargs,
@@ -28,6 +29,7 @@ class LMConfig(PretrainedConfig):
         self.multiple_of = multiple_of
         self.norm_eps = norm_eps
         self.max_seq_len = max_seq_len
+        self.model_max_length = model_max_length
         self.rope_theta = rope_theta
         self.dropout = dropout
         super().__init__(**kwargs)
