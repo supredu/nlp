@@ -88,8 +88,10 @@ class CometEvaluator(Evaluator):
         return self.trainer.val_loader.dataset.dataset.get_references(self._get_samples())
 
     def _get_messages_lst(self):
+        messages_lst = []
         for sample in self._get_samples():
-            yield self.trainer.val_loader.dataset.dataset.extract_messages(sample)
+            messages_lst.append(self.trainer.val_loader.dataset.dataset.extract_messages(sample))
+        return messages_lst
 
     def eval(self):
         """
