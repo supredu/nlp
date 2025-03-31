@@ -16,6 +16,7 @@ from evaluator import CometEvaluator, Evaluator, PerplexityEvaluator
 from model.config import LMConfig
 from model.lora import apply_lora
 from model.model import MiniMindLM
+from tqdm import tqdm
 
 DEFAULT_VAL_SIZE = 1000
 
@@ -105,7 +106,6 @@ class TrainerBase:
         self.lm_config = LMConfig(
             dim=self.args.dim,
             n_layers=self.args.n_layers,
-            max_seq_len=self.args.max_seq_len,
         )
 
         # Load tokenizer
@@ -114,13 +114,16 @@ class TrainerBase:
         # Build model
         self.model = MiniMindLM(self.lm_config).to(self.args.device)
 
+        # Get model parameters
+        self.model_parameters = self.model.parameters()
+
     def setup_dataloader(self):
         # Set up dataset and dataloader
         # Initialize dataset
         ds = self.dataset_cls(
             self.args.data_path,
             self.tokenizer,
-            max_length=self.lm_config.max_seq_len,
+            max_length=self.args.max_seq_len,
         )
 
         # Split into train and validation sets
@@ -159,7 +162,6 @@ class TrainerBase:
 
     def setup_training(self):
         # Initialize optimizer, loss function, and scaler
-        self.model_parameters = self.model.parameters()
         self.optimizer = optim.AdamW(self.model_parameters, lr=self.args.learning_rate)
         self.scaler = torch.cuda.amp.GradScaler(enabled=(self.args.dtype in ["float16", "bfloat16"]))
         self.loss_fct = nn.CrossEntropyLoss(reduction="none")
@@ -253,7 +255,7 @@ class TrainerBase:
         predictions: list[str] = []
 
         with torch.no_grad():
-            for i in range(0, len(messages_lst), self.args.batch_size):
+            for i in tqdm(range(0, len(messages_lst), self.args.batch_size), desc="Generating predictions"):
                 batch_messages = messages_lst[i : i + self.args.batch_size]
                 batch_prompts = self.tokenizer.apply_chat_template(
                     batch_messages,
@@ -278,7 +280,7 @@ class TrainerBase:
                 outputs = self.model.generate(
                     batch_input_ids,
                     eos_token_id=self.tokenizer.eos_token_id,
-                    max_new_tokens=self.args.max_seq_len,
+                    max_new_tokens=self.args.max_new_tokens,
                     temperature=self.args.temperature,
                     top_p=self.args.top_p,
                     pad_token_id=self.tokenizer.pad_token_id,
@@ -311,14 +313,14 @@ class TrainerBase:
 
     def _load_checkpoint_from_continue_training(self, ckp):
         checkpoint = torch.load(ckp, map_location=self.args.device)
-        self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         self.scaler.load_state_dict(checkpoint["scaler"])
         self.start_epoch = checkpoint["epoch"] + 1
 
     def _load_checkpoint_from_prev_stage(self, ckp):
         checkpoint = torch.load(ckp, map_location=self.args.device)
-        self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
         self.start_epoch = 0
 
     def save_checkpoint(self, epoch):
@@ -363,16 +365,27 @@ class LoraTrainer(SFTTrainer):
     prev_category: str = "sft"
     category: str = "lora"
 
+    def __init__(self, args):
+        super().__init__(args)
+        self.freeze_non_lora_parameters()
+
+    def _load_checkpoint_from_prev_stage(self, ckp):
+        checkpoint = torch.load(ckp, map_location=self.args.device)
+        self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        self.start_epoch = 0
+
+    def freeze_non_lora_parameters(self):
+        """Freeze all parameters except LoRA parameters"""
+        # Freeze non-LoRA parameters
+        for name, param in self.model.named_parameters():
+            if "lora" not in name:
+                param.requires_grad = False
+
     def setup_model(self):
         super().setup_model()
 
         # Apply lora
         self.model = apply_lora(self.model, self.args.lora_rank)
-
-        # Freeze non-LoRA parameters
-        for name, param in self.model.named_parameters():
-            if "lora" not in name:
-                param.requires_grad = False
 
         # Collect LoRA parameters for optimization
         self.model_parameters = [param for name, param in self.model.named_parameters() if "lora" in name]
@@ -394,7 +407,6 @@ class DPOTrainer(TrainerBase):
         self.lm_config = LMConfig(
             dim=self.args.dim,
             n_layers=self.args.n_layers,
-            max_seq_len=self.args.max_seq_len,
         )
 
         # Load tokenizer
@@ -404,17 +416,20 @@ class DPOTrainer(TrainerBase):
         self.model = MiniMindLM(self.lm_config).to(self.args.device)
         self.ref_model = MiniMindLM(self.lm_config).to(self.args.device)
 
+        # Get model parameters
+        self.model_parameters = self.model.parameters()
+
     def _load_checkpoint_from_prev_stage(self, ckp):
         state_dict = torch.load(ckp, map_location=self.args.device)
-        self.model.load_state_dict(state_dict["model_state_dict"], strict=False)
-        self.ref_model.load_state_dict(state_dict["model_state_dict"], strict=False)
+        self.model.load_state_dict(state_dict["model_state_dict"])
+        self.ref_model.load_state_dict(state_dict["model_state_dict"])
         self.ref_model.eval()
         self.ref_model.requires_grad_(False)
         self.start_epoch = 0
 
     def _load_checkpoint_from_continue_training(self, ckp):
         checkpoint = torch.load(ckp, map_location=self.args.device)
-        self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
         self.ref_model.load_state_dict(checkpoint["ref_model_state_dict"])
         self.ref_model.eval()
         self.ref_model.requires_grad_(False)

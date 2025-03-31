@@ -92,6 +92,17 @@ class CometEvaluator(Evaluator):
         for sample in self._get_samples():
             messages_lst.append(self.trainer.val_loader.dataset.dataset.extract_messages(sample))
         return messages_lst
+    
+    def _display_samples(self, samples: list[dict[str, str]]):
+        """
+        Display the first 5 samples for debugging purposes.
+        """
+        for i, sample in enumerate(samples):
+            print(f"Sample {i + 1}:")
+            print(f"Source: {sample['src']}")
+            print(f"Reference: {sample['ref']}")
+            print(f"Translation: {sample['mt']}")
+            print()
 
     def eval(self):
         """
@@ -108,6 +119,9 @@ class CometEvaluator(Evaluator):
 
         # Build data for COMET evaluation
         data: list[dict[str, str]] = self._build_data(sources, references, predictions)
+
+        # Display the first 5 samples
+        self._display_samples(data[:5])
 
         # Evaluate using COMET
         model_output = self.comet_model.predict(data, batch_size=32, gpus=1)
