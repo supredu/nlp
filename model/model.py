@@ -222,101 +222,94 @@ class MiniMindLM(PreTrainedModel):
         max_new_tokens=1024,
         temperature=0.75,
         top_p=0.90,
-        stream=False,
         rp=1.0,
         use_cache=True,
         pad_token_id=0,
         **args,
     ):
-        # Stream generation
-        if stream:
-            return self._stream(
-                input_ids,
-                eos_token_id,
-                max_new_tokens,
-                temperature,
-                top_p,
-                rp,
-                use_cache,
-                **args,
-            )
+        # Batch processing setup
+        batch_size = input_ids.size(0)
+        seq_length = input_ids.size(1)
+        device = input_ids.device
+        dtype = input_ids.dtype
 
-        # Non-stream generation
-        generated = []
-        for i in range(input_ids.size(0)):
-            non_pad = input_ids[i][input_ids[i] != pad_token_id].unsqueeze(0)
-            out = self._stream(
-                non_pad,
-                eos_token_id,
-                max_new_tokens,
-                temperature,
-                top_p,
-                rp,
-                use_cache,
-                **args,
-            )
-            tokens_list = [tokens[:, -1:] for tokens in out]
-            gen = torch.cat(tokens_list, dim=-1) if tokens_list else non_pad
-            full_sequence = torch.cat([non_pad, gen], dim=-1)
-            generated.append(full_sequence)
-        max_length = max(seq.size(1) for seq in generated)
-        generated = [
-            torch.cat(
-                [
-                    seq,
-                    torch.full(
-                        (1, max_length - seq.size(1)),
-                        pad_token_id,
-                        dtype=seq.dtype,
-                        device=seq.device,
-                    ),
-                ],
-                dim=-1,
-            )
-            for seq in generated
-        ]
-        return torch.cat(generated, dim=0)
+        # Create attention mask and position ids
+        max_seq_len = seq_length + max_new_tokens
 
-    def _stream(
-        self,
-        input_ids,
-        eos_token_id,
-        max_new_tokens,
-        temperature,
-        top_p,
-        rp,
-        use_cache,
-        **args,
-    ):
-        start, first_seq, past_kvs = input_ids.shape[1], True, None
-        while input_ids.shape[1] < max_new_tokens - 1:
-            if first_seq or not use_cache:
-                out, first_seq = (
-                    self(input_ids, past_key_values=past_kvs, use_cache=use_cache, **args),
-                    False,
-                )
+        # Pre-allocate output tensor
+        output = torch.full((batch_size, max_seq_len), pad_token_id, dtype=dtype, device=device)
+        output[:, :seq_length] = input_ids
+
+        # Track which sequences are still active
+        active_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+        eos_reached = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+        # Initialize past_key_values
+        past_key_values = None
+        start_pos = 0
+
+        # Pre-compute factors
+        inv_temp = 1.0 / (temperature + 1e-9)
+        rp_factor = 1.0 / rp
+
+        # Generation loop
+        for cur_pos in range(seq_length, max_seq_len):
+            # Only process active sequences
+            if not active_mask.any():
+                break
+
+            # Prepare model inputs
+            if past_key_values is None:
+                # First forward pass - use all input_ids
+                model_inputs = output[:, :cur_pos]
+                start_pos = 0
             else:
-                out = self(
-                    input_ids[:, -1:],
-                    past_key_values=past_kvs,
-                    use_cache=use_cache,
-                    start_pos=input_ids.shape[1] - 1,
-                    **args,
-                )
-            logits, past_kvs = out.logits[:, -1, :], out.past_key_values
-            logits[:, list(set(input_ids.tolist()[0]))] /= rp
-            logits /= temperature + 1e-9
-            if top_p is not None and top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+                # Subsequent passes - only use the last token
+                model_inputs = output[:, cur_pos - 1 : cur_pos]
+                start_pos = cur_pos - 1
+
+            # Forward pass
+            out = self(model_inputs, past_key_values=past_key_values, use_cache=use_cache, start_pos=start_pos, **args)
+
+            logits = out.logits[:, -1, :]
+            past_key_values = out.past_key_values
+
+            # Apply temperature and repetition penalty
+            logits = logits * inv_temp
+            if rp != 1.0:
+                # Apply repetition penalty to seen tokens
+                seen_tokens = [set(output[i, :cur_pos].tolist()) for i in range(batch_size) if active_mask[i]]
+                for i, tokens in enumerate(seen_tokens):
+                    logits[i, list(tokens)] *= rp_factor
+
+            # Top-p sampling
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                 sorted_probs = F.softmax(sorted_logits, dim=-1)
                 cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+                # Create mask for tokens to keep
                 sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
-                sorted_indices_to_remove[:, 0] = False
-                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = False
+
+                # Apply mask
+                indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
                 logits[indices_to_remove] = -float("Inf")
-            input_ids_next = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
-            input_ids = torch.cat((input_ids, input_ids_next), dim=1)
-            yield input_ids[:, start:]
-            if input_ids_next.item() == eos_token_id:
+
+            # Sample next tokens
+            probs = F.softmax(logits, dim=-1)
+            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+
+            # Update output with new tokens
+            output[active_mask, cur_pos] = next_tokens[active_mask]
+
+            # Update active mask based on EOS tokens
+            eos_reached[active_mask] = next_tokens[active_mask] == eos_token_id
+            active_mask = ~eos_reached
+
+            # Early stopping if all sequences are finished
+            if not active_mask.any():
                 break
+
+        return output

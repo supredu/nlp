@@ -113,7 +113,7 @@ class SFTDataset(Dataset):
         return references
 
     def extract_messages(self, sample):
-        return sample["conversations"][0]
+        return [sample["conversations"][0]]
 
     def __getitem__(self, index):
         sample = self.samples[index]
@@ -191,7 +191,7 @@ class DPODataset(Dataset):
         return references
 
     def extract_messages(self, sample):
-        return sample["chosen"][0]
+        return [sample["chosen"][0]]
 
     def __getitem__(self, index):
         item = self.samples[index]
