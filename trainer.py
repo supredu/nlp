@@ -17,6 +17,7 @@ from model.config import LMConfig
 from model.lora import apply_lora
 from model.model import MiniMindLM
 
+DEFAULT_VAL_SIZE = 1000
 
 def logits_to_probs(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """Convert logits to log probabilities for the given labels."""
@@ -123,7 +124,8 @@ class TrainerBase:
         )
 
         # Split into train and validation sets
-        train_ds, val_ds = torch.utils.data.random_split(ds, [int(len(ds) * 0.9), len(ds) - int(len(ds) * 0.9)])
+        val_size = min(len(ds) // 10, DEFAULT_VAL_SIZE)
+        train_ds, val_ds = torch.utils.data.random_split(ds, [len(ds) - val_size, val_size])
 
         # Initialize train dataloader
         train_sampler = DistributedSampler(train_ds) if self.ddp else None
