@@ -290,14 +290,14 @@ class TrainerBase:
 
     def _load_checkpoint_from_continue_training(self, ckp):
         checkpoint = torch.load(ckp, map_location=self.args.device)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         self.scaler.load_state_dict(checkpoint["scaler"])
         self.start_epoch = checkpoint["epoch"] + 1
 
     def _load_checkpoint_from_prev_stage(self, ckp):
         checkpoint = torch.load(ckp, map_location=self.args.device)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
         self.start_epoch = 0
 
     def save_checkpoint(self, epoch):
@@ -393,7 +393,7 @@ class DPOTrainer(TrainerBase):
 
     def _load_checkpoint_from_continue_training(self, ckp):
         checkpoint = torch.load(ckp, map_location=self.args.device)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
         self.ref_model.load_state_dict(checkpoint["ref_model_state_dict"])
         self.ref_model.eval()
         self.ref_model.requires_grad_(False)
