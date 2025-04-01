@@ -29,6 +29,7 @@ def parse_args():
     parser.add_argument("--dim", default=512, type=int)
     parser.add_argument("--n_layers", default=8, type=int)
     parser.add_argument("--max_seq_len", default=512, type=int)
+    parser.add_argument("--max_new_tokens", type=int, default=1024)
     parser.add_argument("--data_path", type=str, default="./data/pretrain.jsonl")
 
     args = parser.parse_args()
