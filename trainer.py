@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch import nn, optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from dataset import DPODataset, PretrainDataset, SFTDataset
@@ -16,9 +17,9 @@ from evaluator import CometEvaluator, Evaluator, PerplexityEvaluator
 from model.config import LMConfig
 from model.lora import apply_lora
 from model.model import MiniMindLM
-from tqdm import tqdm
 
 DEFAULT_VAL_SIZE = 1000
+
 
 def logits_to_probs(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """Convert logits to log probabilities for the given labels."""

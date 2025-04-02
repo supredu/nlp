@@ -4,6 +4,7 @@ import warnings
 import torch
 
 from trainer import SFTTrainer
+from utils import set_random_seeds
 
 warnings.filterwarnings("ignore")
 
@@ -43,6 +44,7 @@ def parse_args():
 
 
 def main():
+    set_random_seeds()
     args = parse_args()
     trainer = SFTTrainer(args)
     trainer.run()
