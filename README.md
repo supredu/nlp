@@ -99,6 +99,7 @@ pip install -r requirements.txt
 ├── train_sft.py       # Supervised fine-tuning script
 ├── train_dpo.py       # Direct preference optimization script
 ├── train_lora.py      # LoRA training script
+├── utils.py           # Utility functions
 ├── run.sh             # Shell script to run all training scripts
 └── README.md          # Documentation
 ```
@@ -222,6 +223,7 @@ Tune the hyperparameters in each script to achieve the best performance.
 ├── train_sft.py       # Supervised fine-tuning script
 ├── train_dpo.py       # Direct preference optimization script
 ├── train_lora.py      # LoRA training script
+├── utils.py           # Utility functions
 └── run.sh             # Shell script to run all training scripts
 ```
 

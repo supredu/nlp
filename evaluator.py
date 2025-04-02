@@ -92,7 +92,7 @@ class CometEvaluator(Evaluator):
         for sample in self._get_samples():
             messages_lst.append(self.trainer.val_loader.dataset.dataset.extract_messages(sample))
         return messages_lst
-    
+
     def _display_samples(self, samples: list[dict[str, str]]):
         """
         Display the first 5 samples for debugging purposes.
