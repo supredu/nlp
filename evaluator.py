@@ -69,29 +69,14 @@ class CometEvaluator(Evaluator):
             )
         return data
 
-    def _get_samples(self):
-        # Get subset from the trainer
-        subset = self.trainer.val_loader.dataset
-
-        # Get indices
-        indices = subset.indices
-
-        # Get samples
-        samples = [subset.dataset.samples[indices[i]] for i in range(len(indices))]
-
-        return samples
-
     def _get_sources(self):
-        return self.trainer.val_loader.dataset.dataset.get_sources(self._get_samples())
+        return self.trainer.val_loader.dataset.get_sources()
 
     def _get_references(self):
-        return self.trainer.val_loader.dataset.dataset.get_references(self._get_samples())
+        return self.trainer.val_loader.dataset.get_references()
 
     def _get_messages_lst(self):
-        messages_lst = []
-        for sample in self._get_samples():
-            messages_lst.append(self.trainer.val_loader.dataset.dataset.extract_messages(sample))
-        return messages_lst
+        return self.trainer.val_loader.dataset.get_messages_lst()
 
     def _display_samples(self, samples: list[dict[str, str]]):
         """

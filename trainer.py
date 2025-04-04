@@ -127,9 +127,9 @@ class TrainerBase:
             max_length=self.args.max_seq_len,
         )
 
-        # Split into train and validation sets
-        val_size = min(len(ds) // 10, DEFAULT_VAL_SIZE)
-        train_ds, val_ds = torch.utils.data.random_split(ds, [len(ds) - val_size, val_size])
+        # Get train and validation sets
+        train_ds = ds.train_ds
+        val_ds = ds.val_ds
 
         # Initialize train dataloader
         train_sampler = DistributedSampler(train_ds) if self.ddp else None
