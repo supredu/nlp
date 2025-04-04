@@ -119,7 +119,7 @@ class _SFTIterableDataset(_IterableDataset):
         return references
 
     def get_messages_lst(self):
-        return [sample["conversations"][0] for sample in self.samples]
+        return [[sample["conversations"][0]] for sample in self.samples]
 
     def _inner(self, sample):
         # Build dialogue prompt
@@ -181,7 +181,7 @@ class _DPOIterableDataset(_IterableDataset):
         return references
 
     def get_messages_lst(self):
-        return [sample["chosen"][0] for sample in self.samples]
+        return [[sample["chosen"][0]] for sample in self.samples]
 
     def _inner(self, sample):
         chosen = sample["chosen"]  # A list containing multiple {role, content} pairs

@@ -256,45 +256,21 @@ class TrainerBase:
         predictions: list[str] = []
 
         with torch.no_grad():
-            for i in tqdm(range(0, len(messages_lst), self.args.batch_size), desc="Generating predictions"):
-                batch_messages = messages_lst[i : i + self.args.batch_size]
-                batch_prompts = self.tokenizer.apply_chat_template(
-                    batch_messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
+            for messages in tqdm(messages_lst, desc="Generating predictions"):
+                prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-                # Tokenize all prompts in the batch
-                batch_input_ids = (
-                    self.tokenizer(
-                        batch_prompts,
-                        padding=True,
-                        padding_side="left",
-                        truncation=True,
-                        return_tensors="pt",
-                    )
-                    .to(self.args.device)
-                    .input_ids
-                )
-
-                # Generate outputs for the batch
+                x = torch.tensor(self.tokenizer(prompt)["input_ids"], device=self.args.device).unsqueeze(0)
                 outputs = self.model.generate(
-                    batch_input_ids,
+                    x,
                     eos_token_id=self.tokenizer.eos_token_id,
-                    max_new_tokens=self.args.max_new_tokens,
+                    max_new_tokens=self.args.max_seq_len,
                     temperature=self.args.temperature,
                     top_p=self.args.top_p,
                     pad_token_id=self.tokenizer.pad_token_id,
                 )
-
-                # Process each output in the batch
-                for input_ids, output in zip(batch_input_ids, outputs):
-                    input_length = len(input_ids)
-                    prediction = self.tokenizer.decode(
-                        output[input_length:].tolist(),
-                        skip_special_tokens=True,
-                    )
-                    predictions.append(prediction)
+                predictions.append(
+                    self.tokenizer.decode(outputs.squeeze()[x.shape[1] :].tolist(), skip_special_tokens=True)
+                )
 
         return predictions
 
