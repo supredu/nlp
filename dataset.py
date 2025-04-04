@@ -66,7 +66,7 @@ class _PretrainIterableDataset(_IterableDataset):
         X = torch.tensor(input_ids[:-1], dtype=torch.long)
         Y = torch.tensor(input_ids[1:], dtype=torch.long)
         loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)
-        return loss_mask, X, Y
+        return X, Y, loss_mask
 
 
 class _SFTIterableDataset(_IterableDataset):
