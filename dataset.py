@@ -2,7 +2,7 @@ import json
 import os
 
 import torch
-from torch.utils.data import IterableDataset
+from torch.utils.data import IterableDataset, get_worker_info
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -43,8 +43,16 @@ class _IterableDataset(IterableDataset):
         raise NotImplementedError
 
     def __iter__(self):
-        for sample in self.samples:
-            yield self._inner(sample)
+        worker_info = get_worker_info()
+        if worker_info is None:
+            for sample in self.samples:
+                yield self._inner(sample)
+        else:
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+            for idx, sample in enumerate(self.samples):
+                if idx % num_workers == worker_id:
+                    yield self._inner(sample)
 
     def __len__(self):
         return self.size
