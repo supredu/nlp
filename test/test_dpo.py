@@ -6,12 +6,13 @@ from trainer import dpo_loss
 
 
 @pytest.mark.parametrize(
-    "ref_probs, probs, beta, expected_loss",
+    "ref_probs, probs, mask, beta, expected_loss",
     [
         # Test 1: batch_size=2, seq_len=1, logits=0
         (
             torch.tensor([[-1.0], [-2.0]], dtype=torch.float32),
             torch.tensor([[-0.5], [-1.5]], dtype=torch.float32),
+            torch.ones(2, 1, dtype=torch.int32),
             0.1,
             -F.logsigmoid(torch.tensor(0.0)),
         ),
@@ -19,6 +20,7 @@ from trainer import dpo_loss
         (
             torch.tensor([[-1.0], [-2.0]], dtype=torch.float32),
             torch.tensor([[-0.4], [-1.6]], dtype=torch.float32),
+            torch.ones(2, 1, dtype=torch.int32),
             0.1,
             -F.logsigmoid(torch.tensor(0.2 * 0.1)),
         ),
@@ -26,6 +28,7 @@ from trainer import dpo_loss
         (
             torch.tensor([[-1.0], [-2.0], [-0.5], [-1.5]], dtype=torch.float32),
             torch.tensor([[-0.5], [-1.5], [-0.3], [-1.2]], dtype=torch.float32),
+            torch.ones(4, 1, dtype=torch.int32),
             0.1,
             torch.mean(
                 torch.tensor(
@@ -41,6 +44,7 @@ from trainer import dpo_loss
         (
             torch.tensor([[-1.0, -1.2], [-2.0, -2.2]], dtype=torch.float32),
             torch.tensor([[-0.5, -0.7], [-1.5, -1.7]], dtype=torch.float32),
+            torch.ones(2, 2, dtype=torch.int32),
             0.1,
             -F.logsigmoid(torch.tensor(0.0)),
         ),
@@ -48,6 +52,7 @@ from trainer import dpo_loss
         (
             torch.tensor([[-1.0], [-2.0]], dtype=torch.float32),
             torch.tensor([[-0.5], [-1.5]], dtype=torch.float32),
+            torch.ones(2, 1, dtype=torch.int32),
             0.2,
             -F.logsigmoid(torch.tensor(0.0 * 0.2)),
         ),
@@ -55,6 +60,7 @@ from trainer import dpo_loss
         (
             torch.tensor([[-1.0], [-2.0]], dtype=torch.float32),
             torch.tensor([[-1.5], [-0.5]], dtype=torch.float32),
+            torch.ones(2, 1, dtype=torch.int32),
             0.1,
             -F.logsigmoid(torch.tensor(-2.0 * 0.1)),
         ),
@@ -64,7 +70,8 @@ def test_dpo_loss(
     ref_probs: torch.Tensor,
     probs: torch.Tensor,
     beta: float,
+    mask: torch.Tensor,
     expected_loss: torch.Tensor,
 ) -> None:
-    loss = dpo_loss(ref_probs, probs, beta=beta)
+    loss = dpo_loss(ref_probs, probs, mask, beta=beta)
     assert torch.allclose(loss, expected_loss, atol=1e-5)
