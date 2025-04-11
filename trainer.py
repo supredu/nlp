@@ -28,11 +28,12 @@ def logits_to_probs(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     return probs
 
 
-def dpo_loss(ref_probs: torch.Tensor, probs: torch.Tensor, beta: float = 0.1) -> torch.Tensor:
+def dpo_loss(ref_probs: torch.Tensor, probs: torch.Tensor, mask: torch.Tensor, beta: float = 0.1) -> torch.Tensor:
     """Calculate DPO loss between reference and policy model probabilities."""
     # Average probabilities across sequence length
-    ref_probs = ref_probs.mean(dim=1)
-    probs = probs.mean(dim=1)
+    seq_lengths = mask.sum(dim=1, keepdim=True)  # (batch_size, 1)
+    ref_probs = (ref_probs * mask).sum(dim=1) / seq_lengths.squeeze()
+    probs = (probs * mask).sum(dim=1) / seq_lengths.squeeze()
 
     # Split batch into chosen and rejected
     batch_size = ref_probs.shape[0]
@@ -454,7 +455,7 @@ class DPOTrainer(TrainerBase):
                 probs = probs * mask
 
                 # Calculate DPO loss
-                loss = dpo_loss(ref_probs, probs, beta=0.1)
+                loss = dpo_loss(ref_probs, probs, mask, beta=0.1)
                 loss = loss / self.args.accumulation_steps
 
             # Backward pass with gradient scaling
