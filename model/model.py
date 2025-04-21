@@ -3,6 +3,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
+import math
 
 from .config import LMConfig
 
@@ -26,7 +27,11 @@ class RMSNorm(torch.nn.Module):
             torch.Tensor: Normalized tensor of the same shape as x
         """
         # Write your code here
-
+            # Compute the root mean square (RMS) for the last dimension of x.
+    # Adding eps for numerical stability.
+        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+    # Normalize x and scale by the learnable weight parameter.
+        return x * self.weight / rms
 
 def precompute_pos_cis(dim: int, end: int = int(32 * 1024), theta: float = 1e6):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
@@ -129,7 +134,20 @@ class Attention(nn.Module):
 
         # Implement attention
         # Write your code here
-
+            # Calculate the scaled dot-product attention scores.
+        scores = torch.matmul(xq, xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        # Apply the causal mask to block future tokens.
+        scores = scores + self.mask[:, :, :seq_len, :xk.shape[2]]
+        # Compute the attention weights with softmax.
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.attn_dropout(attn_weights)
+        # Compute the attention context by weighted sum over values.
+        context = torch.matmul(attn_weights, xv)
+        # Reshape the context and pass through the output linear layer.
+        context = context.transpose(1, 2).reshape(bsz, seq_len, self.n_local_heads * self.head_dim)
+        output = self.wo(context)
+        # Apply residual dropout.
+        output = self.resid_dropout(output)
         return output, past_kv
 
 

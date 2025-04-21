@@ -44,7 +44,10 @@ def dpo_loss(ref_probs: torch.Tensor, probs: torch.Tensor, mask: torch.Tensor, b
 
     # Calculate loss
     # Write Your Code Here
-
+        # Compute the difference in log probabilities for chosen versus rejected samples.
+    diff = (chosen_probs - chosen_ref_probs) - (reject_probs - reject_ref_probs)
+    # Calculate DPO loss as negative log sigmoid of the scaled difference.
+    loss = -torch.log(torch.sigmoid(beta * diff))
     return loss.mean()
 
 
